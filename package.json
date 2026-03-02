@@ -1,0 +1,16 @@
+{
+  "name": "pi-hawk-provider",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Pi extension: Hawk OAuth provider with OpenAI and Anthropic routing",
+  "scripts": {
+    "check": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@mariozechner/pi-ai": "^0.7.29",
+    "@mariozechner/pi-coding-agent": "^0.7.29",
+    "@types/node": "^22.9.0",
+    "typescript": "^5.6.3"
+  }
+}
