@@ -7,8 +7,8 @@ import {
 	type Context,
 	type Model,
 	type SimpleStreamOptions,
-	streamAnthropic,
 	streamOpenAICompletions,
+	streamOpenAIResponses,
 } from "@mariozechner/pi-ai";
 
 const DEFAULT_ISSUER = "https://metr.okta.com/oauth2/aus1ww3m0x41jKp3L1d8/";
@@ -22,8 +22,18 @@ const DEFAULT_OPENAI_ROUTE = "openai/v1";
 const DEFAULT_ANTHROPIC_ROUTE = "anthropic";
 const TOKEN_EXPIRY_BUFFER_MS = 5 * 60 * 1000;
 const DEFAULT_POLL_INTERVAL_MS = 2000;
+const HAWK_PROVIDER_DEBUG = process.env.HAWK_PROVIDER_DEBUG === "1" || process.env.HAWK_PROVIDER_DEBUG === "true";
 
 const SERVICE_PREFIXES = new Set(["azure", "bedrock", "vertex"]);
+
+function debugLog(message: string, details?: unknown): void {
+	if (!HAWK_PROVIDER_DEBUG) return;
+	if (details !== undefined) {
+		console.error(`[pi-hawk-provider] ${message}`, details);
+		return;
+	}
+	console.error(`[pi-hawk-provider] ${message}`);
+}
 
 type HawkBackend = "openai" | "anthropic";
 
@@ -77,6 +87,7 @@ interface HawkModelConfig {
 	name: string;
 	backend: HawkBackend;
 	upstreamModel: string;
+	openaiApi?: "openai-completions" | "openai-responses";
 	reasoning: boolean;
 	input: ("text" | "image")[];
 	contextWindow: number;
@@ -282,7 +293,8 @@ function extractUpstreamModel(name: string): { backend: HawkBackend; upstreamMod
 		if (parts.length < 3) {
 			return null;
 		}
-		return { backend: "openai", upstreamModel: parts.slice(2).join("/") };
+		// Keep full model identifier for OpenAI-compatible routing providers.
+		return { backend: "openai", upstreamModel: name };
 	}
 
 	return null;
@@ -305,6 +317,21 @@ function inferInput(modelId: string): ("text" | "image")[] {
 		return ["text", "image"];
 	}
 	return ["text"];
+}
+
+function inferOpenAIApi(modelId: string): "openai-completions" | "openai-responses" {
+	const lower = modelId.toLowerCase();
+	const leaf = lower.split("/").at(-1) ?? lower;
+
+	const isCodex = lower.includes("codex") || leaf.includes("codex");
+	const isGpt5Series = /^gpt-5(?:$|[-.])/.test(leaf);
+	const isOSeries = /^o[134](?:$|[-.])/.test(leaf);
+
+	if (isCodex || isGpt5Series || isOSeries) {
+		return "openai-responses";
+	}
+
+	return "openai-completions";
 }
 
 function buildDiscoveredModels(permittedModelNames: string[]): HawkModelConfig[] {
@@ -332,6 +359,7 @@ function buildDiscoveredModels(permittedModelNames: string[]): HawkModelConfig[]
 			name: `${upstreamModel} (Hawk)`,
 			backend,
 			upstreamModel,
+			openaiApi: backend === "openai" ? inferOpenAIApi(upstreamModel) : undefined,
 			reasoning: inferReasoning(upstreamModel),
 			input: inferInput(upstreamModel),
 			contextWindow: backend === "anthropic" ? 200000 : 128000,
@@ -366,7 +394,9 @@ function extractPermittedModelNames(payload: unknown): string[] {
 }
 
 async function fetchPermittedModelNames(accessToken: string, config: HawkConfig): Promise<string[]> {
-	const response = await fetch(`${config.middlemanBaseUrl}/permitted_models`, {
+	const url = `${config.middlemanBaseUrl}/permitted_models`;
+	debugLog("Fetching permitted Hawk models", { url });
+	const response = await fetch(url, {
 		method: "POST",
 		headers: {
 			"Content-Type": "application/json",
@@ -384,13 +414,27 @@ async function fetchPermittedModelNames(accessToken: string, config: HawkConfig)
 	}
 
 	const payload = parseJson<unknown>(text);
-	return extractPermittedModelNames(payload);
+	const names = extractPermittedModelNames(payload);
+	debugLog("Received permitted model names", {
+		count: names.length,
+		sample: names.slice(0, 20),
+	});
+	return names;
 }
 
 async function tryDiscoverModels(accessToken: string, config: HawkConfig, onProgress?: (message: string) => void): Promise<void> {
 	onProgress?.("Discovering Hawk models...");
 	const names = await fetchPermittedModelNames(accessToken, config);
 	const discoveredModels = buildDiscoveredModels(names);
+	debugLog("Built discovered Hawk models", {
+		count: discoveredModels.length,
+		sample: discoveredModels.slice(0, 20).map((model) => ({
+			id: model.id,
+			backend: model.backend,
+			upstreamModel: model.upstreamModel,
+			openaiApi: model.openaiApi,
+		})),
+	});
 	if (discoveredModels.length === 0) {
 		throw new Error("No OpenAI/Anthropic-compatible models found in Hawk permitted model list");
 	}
@@ -559,6 +603,299 @@ async function refreshHawkToken(credentials: OAuthCredentials): Promise<OAuthCre
 	};
 }
 
+class MinimalAssistantMessageEventStream<TEvent, TResult> implements AsyncIterable<TEvent> {
+	private queue: TEvent[] = [];
+	private waiting: Array<(value: IteratorResult<TEvent>) => void> = [];
+	private done = false;
+	private resolveResult!: (result: TResult) => void;
+	private resultPromise: Promise<TResult>;
+
+	constructor() {
+		this.resultPromise = new Promise<TResult>((resolve) => {
+			this.resolveResult = resolve;
+		});
+	}
+
+	push(event: TEvent): void {
+		if (this.done) return;
+		const waiter = this.waiting.shift();
+		if (waiter) {
+			waiter({ value: event, done: false });
+		} else {
+			this.queue.push(event);
+		}
+	}
+
+	end(result: TResult): void {
+		if (this.done) return;
+		this.done = true;
+		this.resolveResult(result);
+		while (this.waiting.length > 0) {
+			const waiter = this.waiting.shift();
+			waiter?.({ value: undefined as never, done: true });
+		}
+	}
+
+	result(): Promise<TResult> {
+		return this.resultPromise;
+	}
+
+	async *[Symbol.asyncIterator](): AsyncIterator<TEvent> {
+		while (true) {
+			if (this.queue.length > 0) {
+				yield this.queue.shift() as TEvent;
+				continue;
+			}
+			if (this.done) {
+				return;
+			}
+			const next = await new Promise<IteratorResult<TEvent>>((resolve) => this.waiting.push(resolve));
+			if (next.done) return;
+			yield next.value;
+		}
+	}
+}
+
+function createAssistantOutput(model: Model<Api>) {
+	return {
+		role: "assistant",
+		content: [] as Array<{ type: string; [key: string]: unknown }>,
+		api: model.api,
+		provider: model.provider,
+		model: model.id,
+		usage: {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: "stop",
+		timestamp: Date.now(),
+	};
+}
+
+function mapAnthropicStopReason(reason: unknown): "stop" | "length" | "toolUse" {
+	if (reason === "max_tokens") return "length";
+	if (reason === "tool_use") return "toolUse";
+	return "stop";
+}
+
+function toAnthropicContent(content: unknown): Array<Record<string, unknown>> {
+	if (typeof content === "string") {
+		return [{ type: "text", text: content }];
+	}
+	if (!Array.isArray(content)) {
+		return [{ type: "text", text: String(content ?? "") }];
+	}
+	const blocks: Array<Record<string, unknown>> = [];
+	for (const item of content) {
+		if (!item || typeof item !== "object") continue;
+		const block = item as Record<string, unknown>;
+		if (block.type === "text" && typeof block.text === "string") {
+			blocks.push({ type: "text", text: block.text });
+			continue;
+		}
+		if (block.type === "image" && typeof block.data === "string" && typeof block.mimeType === "string") {
+			blocks.push({
+				type: "image",
+				source: {
+					type: "base64",
+					media_type: block.mimeType,
+					data: block.data,
+				},
+			});
+		}
+	}
+	if (blocks.length === 0) {
+		blocks.push({ type: "text", text: "" });
+	}
+	return blocks;
+}
+
+function convertContextMessagesForAnthropic(context: Context): Array<Record<string, unknown>> {
+	const result: Array<Record<string, unknown>> = [];
+	for (const rawMessage of context.messages as Array<Record<string, unknown>>) {
+		if (!rawMessage || typeof rawMessage !== "object") continue;
+		if (rawMessage.role === "user") {
+			result.push({ role: "user", content: toAnthropicContent(rawMessage.content) });
+			continue;
+		}
+		if (rawMessage.role === "assistant") {
+			const assistantContent = Array.isArray(rawMessage.content) ? rawMessage.content : [];
+			const converted: Array<Record<string, unknown>> = [];
+			for (const blockValue of assistantContent) {
+				if (!blockValue || typeof blockValue !== "object") continue;
+				const block = blockValue as Record<string, unknown>;
+				if (block.type === "text" && typeof block.text === "string") {
+					converted.push({ type: "text", text: block.text });
+					continue;
+				}
+				if (block.type === "thinking" && typeof block.thinking === "string") {
+					converted.push({ type: "text", text: block.thinking });
+					continue;
+				}
+				if (block.type === "toolCall") {
+					converted.push({
+						type: "tool_use",
+						id: String(block.id ?? "tool"),
+						name: String(block.name ?? "tool"),
+						input: (block.arguments as Record<string, unknown>) ?? {},
+					});
+				}
+			}
+			if (converted.length > 0) {
+				result.push({ role: "assistant", content: converted });
+			}
+			continue;
+		}
+		if (rawMessage.role === "toolResult") {
+			const toolResultContent = Array.isArray(rawMessage.content) ? rawMessage.content : [];
+			const textParts = toolResultContent
+				.map((blockValue) => {
+					if (!blockValue || typeof blockValue !== "object") return "";
+					const block = blockValue as Record<string, unknown>;
+					if (block.type === "text" && typeof block.text === "string") return block.text;
+					if (block.type === "image") return "[image]";
+					return "";
+				})
+				.filter((text) => text.length > 0)
+				.join("\n");
+			result.push({
+				role: "user",
+				content: [
+					{
+						type: "tool_result",
+						tool_use_id: String(rawMessage.toolCallId ?? "tool"),
+						content: textParts || "[tool result]",
+						is_error: Boolean(rawMessage.isError),
+					},
+				],
+			});
+		}
+	}
+	return result;
+}
+
+function streamAnthropicViaMiddleman(
+	model: Model<Api>,
+	modelConfig: HawkModelConfig,
+	context: Context,
+	accessToken: string,
+	config: HawkConfig,
+	options?: SimpleStreamOptions,
+): AssistantMessageEventStream {
+	const stream = new MinimalAssistantMessageEventStream<any, any>();
+	const output = createAssistantOutput(model);
+	stream.push({ type: "start", partial: output });
+
+	void (async () => {
+		try {
+			const url = `${config.anthropicBaseUrl.replace(/\/+$/, "")}/v1/messages`;
+			const requestBody: Record<string, unknown> = {
+				model: modelConfig.upstreamModel,
+				messages: convertContextMessagesForAnthropic(context),
+				max_tokens: options?.maxTokens || ((model.maxTokens / 3) | 0),
+				stream: false,
+			};
+			if (context.systemPrompt) {
+				requestBody.system = context.systemPrompt;
+			}
+			if (Array.isArray(context.tools) && context.tools.length > 0) {
+				requestBody.tools = context.tools.map((tool) => {
+					const cast = tool as Record<string, unknown>;
+					return {
+						name: String(cast.name ?? "tool"),
+						description: typeof cast.description === "string" ? cast.description : "",
+						input_schema: cast.parameters ?? { type: "object", properties: {} },
+					};
+				});
+			}
+
+			debugLog("Anthropic request", { url, model: modelConfig.upstreamModel });
+			const response = await fetch(url, {
+				method: "POST",
+				headers: {
+					Authorization: `Bearer ${accessToken}`,
+					"Content-Type": "application/json",
+					Accept: "application/json",
+					"anthropic-version": "2023-06-01",
+				},
+				body: JSON.stringify(requestBody),
+				signal: options?.signal,
+			});
+			const text = await response.text();
+			if (!response.ok) {
+				throw new Error(`${response.status} ${text}`);
+			}
+			const payload = parseJson<Record<string, unknown>>(text);
+			const usage = (payload.usage as Record<string, unknown> | undefined) ?? {};
+			output.usage.input = Number(usage.input_tokens ?? 0);
+			output.usage.output = Number(usage.output_tokens ?? 0);
+			output.usage.cacheRead = Number(usage.cache_read_input_tokens ?? 0);
+			output.usage.cacheWrite = Number(usage.cache_creation_input_tokens ?? 0);
+			output.usage.totalTokens =
+				output.usage.input + output.usage.output + output.usage.cacheRead + output.usage.cacheWrite;
+			output.stopReason = mapAnthropicStopReason(payload.stop_reason);
+
+			const content = Array.isArray(payload.content) ? payload.content : [];
+			for (const blockValue of content) {
+				if (!blockValue || typeof blockValue !== "object") continue;
+				const block = blockValue as Record<string, unknown>;
+				if (block.type === "text" && typeof block.text === "string") {
+					const contentIndex = output.content.length;
+					const textBlock = { type: "text", text: block.text };
+					output.content.push(textBlock);
+					stream.push({ type: "text_start", contentIndex, partial: output });
+					stream.push({ type: "text_delta", contentIndex, delta: block.text, partial: output });
+					stream.push({ type: "text_end", contentIndex, content: block.text, partial: output });
+					continue;
+				}
+				if (block.type === "thinking" && typeof block.thinking === "string") {
+					const contentIndex = output.content.length;
+					const thinkingBlock = { type: "thinking", thinking: block.thinking };
+					output.content.push(thinkingBlock);
+					stream.push({ type: "thinking_start", contentIndex, partial: output });
+					stream.push({ type: "thinking_delta", contentIndex, delta: block.thinking, partial: output });
+					stream.push({ type: "thinking_end", contentIndex, content: block.thinking, partial: output });
+					continue;
+				}
+				if (block.type === "tool_use") {
+					const contentIndex = output.content.length;
+					const toolCall = {
+						type: "toolCall",
+						id: String(block.id ?? `tool-${contentIndex}`),
+						name: String(block.name ?? "tool"),
+						arguments: (block.input as Record<string, unknown>) ?? {},
+					};
+					output.content.push(toolCall);
+					stream.push({ type: "toolcall_start", contentIndex, partial: output });
+					stream.push({ type: "toolcall_end", contentIndex, toolCall, partial: output });
+				}
+			}
+
+			const doneReason =
+				output.stopReason === "length" || output.stopReason === "toolUse" ? output.stopReason : "stop";
+			stream.push({ type: "done", reason: doneReason, message: output });
+			stream.end(output);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			debugLog("Anthropic request failed", { model: modelConfig.upstreamModel, message });
+			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
+			(output as Record<string, unknown>).errorMessage = message;
+			stream.push({
+				type: "error",
+				reason: output.stopReason,
+				error: output,
+			});
+			stream.end(output);
+		}
+	})();
+
+	return stream as unknown as AssistantMessageEventStream;
+}
+
 export function streamHawk(
 	model: Model<Api>,
 	context: Context,
@@ -567,15 +904,36 @@ export function streamHawk(
 	const config = getConfig();
 	const modelConfig = runtimeModels.find((candidate) => candidate.id === model.id);
 	if (!modelConfig) {
-		throw new Error(`Unknown Hawk model: ${model.id}`);
+		throw new Error(`Unknown Hawk model: ${model.id}. discovered=${runtimeModels.length}`);
 	}
 
-	const accessToken = options?.apiKey ?? process.env.HAWK_ACCESS_TOKEN;
+	const accessToken = options?.apiKey ?? process.env.HAWK_ACCESS_TOKEN ?? readStoredHawkAccessToken();
 	if (!accessToken) {
 		throw new Error("No Hawk access token. Run /login hawk or set HAWK_ACCESS_TOKEN.");
 	}
 
 	if (modelConfig.backend === "openai") {
+		const openaiApi = modelConfig.openaiApi ?? "openai-completions";
+		debugLog("Routing Hawk OpenAI request", {
+			model: model.id,
+			upstreamModel: modelConfig.upstreamModel,
+			api: openaiApi,
+			baseUrl: config.openaiBaseUrl,
+		});
+
+		if (openaiApi === "openai-responses") {
+			const openaiModel: Model<"openai-responses"> = {
+				...model,
+				id: modelConfig.upstreamModel,
+				api: "openai-responses",
+				baseUrl: config.openaiBaseUrl,
+			};
+			return streamOpenAIResponses(openaiModel, context, {
+				...(options ?? {}),
+				apiKey: accessToken,
+			});
+		}
+
 		const openaiModel: Model<"openai-completions"> = {
 			...model,
 			id: modelConfig.upstreamModel,
@@ -588,19 +946,12 @@ export function streamHawk(
 		});
 	}
 
-	// Anthropic Bearer mode via the provider's GitHub Copilot path.
-	// This makes streamAnthropic use Authorization: Bearer <token>.
-	const anthropicModel: Model<"anthropic-messages"> = {
-		...model,
-		id: modelConfig.upstreamModel,
-		api: "anthropic-messages",
+	debugLog("Routing Hawk Anthropic request", {
+		model: model.id,
+		upstreamModel: modelConfig.upstreamModel,
 		baseUrl: config.anthropicBaseUrl,
-		provider: "github-copilot",
-	};
-	return streamAnthropic(anthropicModel, context, {
-		...(options ?? {}),
-		apiKey: accessToken,
 	});
+	return streamAnthropicViaMiddleman(model, modelConfig, context, accessToken, config, options);
 }
 
 export default async function (pi: ExtensionAPI): Promise<void> {
@@ -609,9 +960,12 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	if (initialAccessToken) {
 		try {
 			await tryDiscoverModels(initialAccessToken, config);
-		} catch {
+		} catch (error) {
+			debugLog("Startup model discovery failed", error);
 			// Leave model list empty on startup if discovery fails.
 		}
+	} else {
+		debugLog("No startup Hawk token found; model discovery deferred until /login");
 	}
 
 	pi.registerProvider("hawk", {

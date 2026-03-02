@@ -6,7 +6,7 @@ Pi extension that adds a `hawk` provider with:
 - automatic access-token refresh using refresh token
 - automatic model discovery from Hawk (`/permitted_models`) for all accessible OpenAI/Anthropic-compatible models
 - model routing to Hawk middleman for:
-  - OpenAI-compatible requests
+  - OpenAI-compatible requests (chat-completions or responses, based on model)
   - Anthropic requests
 
 ## Status
@@ -67,6 +67,7 @@ All settings are optional.
 - `HAWK_MIDDLEMAN_BASE_URL` (default: `https://middleman.internal.metr.org`)
 - `HAWK_OPENAI_BASE_URL` (default: `${HAWK_MIDDLEMAN_BASE_URL}/openai/v1`)
 - `HAWK_ANTHROPIC_BASE_URL` (default: `${HAWK_MIDDLEMAN_BASE_URL}/anthropic`)
+- `HAWK_PROVIDER_DEBUG` (`1` or `true` to print discovery/routing debug logs to stderr)
 
 ## Model discovery
 

@@ -47,4 +47,10 @@ declare module "@mariozechner/pi-ai" {
 		context: Context,
 		options?: SimpleStreamOptions,
 	): AssistantMessageEventStream;
+
+	export function streamOpenAIResponses(
+		model: Model<"openai-responses">,
+		context: Context,
+		options?: SimpleStreamOptions,
+	): AssistantMessageEventStream;
 }
