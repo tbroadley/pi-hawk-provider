@@ -818,6 +818,7 @@ function streamAnthropicViaMiddleman(
 				method: "POST",
 				headers: {
 					Authorization: `Bearer ${accessToken}`,
+					"x-api-key": accessToken,
 					"Content-Type": "application/json",
 					Accept: "application/json",
 					"anthropic-version": "2023-06-01",
