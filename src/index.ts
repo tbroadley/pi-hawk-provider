@@ -314,40 +314,6 @@ function extractUpstreamModel(name: string): { backend: HawkBackend; upstreamMod
 	return null;
 }
 
-function inferReasoning(modelId: string): boolean {
-	const lower = modelId.toLowerCase();
-	return (
-		lower.includes("claude") ||
-		lower.includes("gpt-5") ||
-		lower.startsWith("o1") ||
-		lower.startsWith("o3") ||
-		lower.includes("reason")
-	);
-}
-
-function inferInput(modelId: string): ("text" | "image")[] {
-	const lower = modelId.toLowerCase();
-	if (lower.includes("vision") || lower.includes("4o") || lower.includes("claude") || lower.includes("vl")) {
-		return ["text", "image"];
-	}
-	return ["text"];
-}
-
-function inferOpenAIApi(modelId: string): "openai-completions" | "openai-responses" {
-	const lower = modelId.toLowerCase();
-	const leaf = lower.split("/").at(-1) ?? lower;
-
-	const isCodex = lower.includes("codex") || leaf.includes("codex");
-	const isGpt5Series = /^gpt-5(?:$|[-.])/.test(leaf);
-	const isOSeries = /^o[134](?:$|[-.])/.test(leaf);
-
-	if (isCodex || isGpt5Series || isOSeries) {
-		return "openai-responses";
-	}
-
-	return "openai-completions";
-}
-
 function findBuiltInModel(backend: HawkBackend, upstreamModel: string): Model<Api> | undefined {
 	const map = backend === "openai" ? builtInOpenAIModels : builtInAnthropicModels;
 	const exact = map.get(upstreamModel);
@@ -358,10 +324,10 @@ function findBuiltInModel(backend: HawkBackend, upstreamModel: string): Model<Ap
 	return map.get(leaf);
 }
 
-function resolvedOpenAIApiFromBuiltIn(model: Model<Api> | undefined, fallbackModelId: string): "openai-completions" | "openai-responses" {
-	if (model?.api === "openai-responses") return "openai-responses";
-	if (model?.api === "openai-completions") return "openai-completions";
-	return inferOpenAIApi(fallbackModelId);
+function resolvedOpenAIApiFromBuiltIn(model: Model<Api>): "openai-completions" | "openai-responses" | undefined {
+	if (model.api === "openai-responses") return "openai-responses";
+	if (model.api === "openai-completions") return "openai-completions";
+	return undefined;
 }
 
 function buildDiscoveredModels(permittedModelNames: string[]): HawkModelConfig[] {
@@ -385,20 +351,34 @@ function buildDiscoveredModels(permittedModelNames: string[]): HawkModelConfig[]
 		const backend = entry.parsed.backend;
 		const id = upstreamModel;
 		const builtIn = findBuiltInModel(backend, upstreamModel);
+		if (!builtIn) {
+			debugLog("Skipping discovered model with no built-in metadata match", {
+				backend,
+				upstreamModel,
+			});
+			continue;
+		}
+
+		const openaiApi = backend === "openai" ? resolvedOpenAIApiFromBuiltIn(builtIn) : undefined;
+		if (backend === "openai" && !openaiApi) {
+			debugLog("Skipping discovered OpenAI model with unsupported built-in api", {
+				upstreamModel,
+				builtInApi: builtIn.api,
+			});
+			continue;
+		}
+
 		models.push({
 			id,
-			name: `${builtIn?.name ?? upstreamModel} (Hawk)`,
+			name: `${builtIn.name} (Hawk)`,
 			backend,
 			upstreamModel,
-			openaiApi:
-				backend === "openai"
-					? resolvedOpenAIApiFromBuiltIn(builtIn, upstreamModel)
-					: undefined,
-			reasoning: builtIn?.reasoning ?? inferReasoning(upstreamModel),
-			input: builtIn?.input ?? inferInput(upstreamModel),
-			contextWindow: builtIn?.contextWindow ?? (backend === "anthropic" ? 200000 : 128000),
-			maxTokens: builtIn?.maxTokens ?? (backend === "anthropic" ? 64000 : 16384),
-			cost: builtIn?.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			openaiApi,
+			reasoning: builtIn.reasoning,
+			input: builtIn.input,
+			contextWindow: builtIn.contextWindow,
+			maxTokens: builtIn.maxTokens,
+			cost: builtIn.cost,
 		});
 	}
 
@@ -654,7 +634,10 @@ export function streamHawk(
 	}
 
 	if (modelConfig.backend === "openai") {
-		const openaiApi = modelConfig.openaiApi ?? "openai-completions";
+		const openaiApi = modelConfig.openaiApi;
+		if (!openaiApi) {
+			throw new Error(`No built-in OpenAI api mapping for model: ${model.id}`);
+		}
 		debugLog("Routing Hawk OpenAI request", {
 			model: model.id,
 			upstreamModel: modelConfig.upstreamModel,
