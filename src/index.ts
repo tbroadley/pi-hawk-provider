@@ -52,9 +52,10 @@ interface OAuthLoginCallbacks {
 	signal?: AbortSignal;
 }
 
-interface ProviderModelConfig {
+export interface ProviderModelConfig {
 	id: string;
 	name: string;
+	api?: string;
 	reasoning: boolean;
 	input: ("text" | "image")[];
 	cost: { input: number; output: number; cacheRead: number; cacheWrite: number };
@@ -84,7 +85,7 @@ interface ExtensionAPI {
 	registerProvider(name: string, config: ProviderConfig): void;
 }
 
-interface HawkModelConfig {
+export interface HawkModelConfig {
 	id: string;
 	name: string;
 	backend: HawkBackend;
@@ -237,10 +238,11 @@ async function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
 	});
 }
 
-function toProviderModelConfig(model: HawkModelConfig): ProviderModelConfig {
+export function toProviderModelConfig(model: HawkModelConfig): ProviderModelConfig {
 	return {
 		id: model.id,
 		name: model.name,
+		api: model.backend === "anthropic" ? "anthropic-messages" : model.openaiApi,
 		reasoning: model.reasoning,
 		input: model.input,
 		cost: model.cost,
@@ -330,7 +332,7 @@ function resolvedOpenAIApiFromBuiltIn(model: Model<Api>): "openai-completions" |
 	return undefined;
 }
 
-function buildDiscoveredModels(permittedModelNames: string[]): HawkModelConfig[] {
+export function buildDiscoveredModels(permittedModelNames: string[]): HawkModelConfig[] {
 	const normalized = dedupeStrings(permittedModelNames)
 		.map((name) => ({ name, parsed: extractUpstreamModel(name) }))
 		.filter((entry): entry is { name: string; parsed: { backend: HawkBackend; upstreamModel: string } } =>
