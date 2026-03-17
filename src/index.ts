@@ -90,6 +90,7 @@ interface HawkModelConfig {
 	backend: HawkBackend;
 	upstreamModel: string;
 	openaiApi?: "openai-completions" | "openai-responses";
+	anthropicSpeed?: "fast";
 	reasoning: boolean;
 	input: ("text" | "image")[];
 	contextWindow: number;
@@ -146,6 +147,22 @@ interface OAuthTokenError {
 
 interface PermittedModelsResponseObject {
 	models?: unknown;
+}
+
+interface PermittedModelEntryObject {
+	name?: unknown;
+	model?: unknown;
+	id?: unknown;
+	supportsFastMode?: unknown;
+	supports_fast_mode?: unknown;
+	fastMode?: unknown;
+	fast_mode?: unknown;
+}
+
+interface PermittedModelEntry {
+	name: string;
+	hasFastModeMetadata: boolean;
+	supportsFastMode: boolean;
 }
 
 function env(name: string, fallback: string): string {
@@ -266,10 +283,6 @@ function replaceRuntimeModels(models: HawkModelConfig[]): void {
 	providerModels.splice(0, providerModels.length, ...models.map(toProviderModelConfig));
 }
 
-function dedupeStrings(values: string[]): string[] {
-	return Array.from(new Set(values));
-}
-
 function extractUpstreamModel(name: string): { backend: HawkBackend; upstreamModel: string } | null {
 	const parts = name.split("/").filter((part) => part.length > 0);
 	if (parts.length === 0) {
@@ -342,26 +355,104 @@ function resolvedOpenAIApiFromBuiltIn(model: Model<Api>): "openai-completions" |
 	return undefined;
 }
 
-function buildDiscoveredModels(permittedModelNames: string[]): HawkModelConfig[] {
-	const normalized = dedupeStrings(permittedModelNames)
-		.map((name) => ({ name, parsed: extractUpstreamModel(name) }))
-		.filter((entry): entry is { name: string; parsed: { backend: HawkBackend; upstreamModel: string } } =>
-			entry.parsed !== null,
-		);
+function supportsAnthropicFastMode(modelId: string): boolean {
+	const lower = modelId.toLowerCase();
+	return (
+		lower.includes("opus-4-6") ||
+		lower.includes("opus-4.6") ||
+		lower.includes("sonnet-4-6") ||
+		lower.includes("sonnet-4.6")
+	);
+}
 
-	const seen = new Set<string>();
-	const models: HawkModelConfig[] = [];
+function toPermittedModelEntry(value: unknown): PermittedModelEntry | null {
+	if (typeof value === "string") {
+		return { name: value, hasFastModeMetadata: false, supportsFastMode: false };
+	}
 
-	for (const entry of normalized) {
-		const key = `${entry.parsed.backend}:${entry.parsed.upstreamModel}`;
-		if (seen.has(key)) {
+	if (!value || typeof value !== "object") {
+		return null;
+	}
+
+	const maybeEntry = value as PermittedModelEntryObject;
+	const name =
+		typeof maybeEntry.name === "string"
+			? maybeEntry.name
+			: typeof maybeEntry.model === "string"
+				? maybeEntry.model
+				: typeof maybeEntry.id === "string"
+					? maybeEntry.id
+					: undefined;
+	if (!name) {
+		return null;
+	}
+
+	const fastModeValues = [
+		maybeEntry.supportsFastMode,
+		maybeEntry.supports_fast_mode,
+		maybeEntry.fastMode,
+		maybeEntry.fast_mode,
+	].filter((entry): entry is boolean => typeof entry === "boolean");
+
+	return {
+		name,
+		hasFastModeMetadata: fastModeValues.length > 0,
+		supportsFastMode: fastModeValues.some((entry) => entry),
+	};
+}
+
+function extractPermittedModelEntries(payload: unknown): PermittedModelEntry[] {
+	if (Array.isArray(payload)) {
+		return payload
+			.map(toPermittedModelEntry)
+			.filter((entry): entry is PermittedModelEntry => entry !== null);
+	}
+
+	if (payload && typeof payload === "object") {
+		const maybeObject = payload as PermittedModelsResponseObject;
+		if (Array.isArray(maybeObject.models)) {
+			return maybeObject.models
+				.map(toPermittedModelEntry)
+				.filter((entry): entry is PermittedModelEntry => entry !== null);
+		}
+	}
+
+	return [];
+}
+
+function buildDiscoveredModels(permittedModelEntries: PermittedModelEntry[]): HawkModelConfig[] {
+	const normalized = new Map<
+		string,
+		{ backend: HawkBackend; upstreamModel: string; hasFastModeMetadata: boolean; supportsFastMode: boolean }
+	>();
+
+	for (const entry of permittedModelEntries) {
+		const parsed = extractUpstreamModel(entry.name);
+		if (!parsed) {
 			continue;
 		}
-		seen.add(key);
 
-		const upstreamModel = entry.parsed.upstreamModel;
-		const backend = entry.parsed.backend;
-		const id = upstreamModel;
+		const key = `${parsed.backend}:${parsed.upstreamModel}`;
+		const existing = normalized.get(key);
+		if (existing) {
+			existing.hasFastModeMetadata ||= entry.hasFastModeMetadata;
+			existing.supportsFastMode ||= entry.supportsFastMode;
+			continue;
+		}
+
+		normalized.set(key, {
+			backend: parsed.backend,
+			upstreamModel: parsed.upstreamModel,
+			hasFastModeMetadata: entry.hasFastModeMetadata,
+			supportsFastMode: entry.supportsFastMode,
+		});
+	}
+
+	const models: HawkModelConfig[] = [];
+
+	for (const entry of normalized.values()) {
+		const upstreamModel = entry.upstreamModel;
+		const backend = entry.backend;
 		const builtIn = findBuiltInModel(backend, upstreamModel);
 		if (!builtIn) {
 			debugLog("Skipping discovered model with no built-in metadata match", {
@@ -380,9 +471,7 @@ function buildDiscoveredModels(permittedModelNames: string[]): HawkModelConfig[]
 			continue;
 		}
 
-		models.push({
-			id,
-			name: `${builtIn.name} (Hawk)`,
+		const shared = {
 			backend,
 			upstreamModel,
 			openaiApi,
@@ -391,7 +480,27 @@ function buildDiscoveredModels(permittedModelNames: string[]): HawkModelConfig[]
 			contextWindow: builtIn.contextWindow,
 			maxTokens: builtIn.maxTokens,
 			cost: builtIn.cost,
+		} satisfies Omit<HawkModelConfig, "id" | "name">;
+
+		models.push({
+			id: upstreamModel,
+			name: `${builtIn.name} (Hawk)`,
+			...shared,
 		});
+
+		const enableAnthropicFastMode =
+			backend === "anthropic" &&
+			(entry.hasFastModeMetadata
+				? entry.supportsFastMode
+				: supportsAnthropicFastMode(upstreamModel) || supportsAnthropicFastMode(builtIn.id));
+		if (enableAnthropicFastMode) {
+			models.push({
+				id: `${upstreamModel}-fast`,
+				name: `${builtIn.name} (Hawk) (fast)`,
+				anthropicSpeed: "fast",
+				...shared,
+			});
+		}
 	}
 
 	models.sort((a, b) => {
@@ -404,22 +513,7 @@ function buildDiscoveredModels(permittedModelNames: string[]): HawkModelConfig[]
 	return models;
 }
 
-function extractPermittedModelNames(payload: unknown): string[] {
-	if (Array.isArray(payload)) {
-		return payload.filter((value): value is string => typeof value === "string");
-	}
-
-	if (payload && typeof payload === "object") {
-		const maybeObject = payload as PermittedModelsResponseObject;
-		if (Array.isArray(maybeObject.models)) {
-			return maybeObject.models.filter((value): value is string => typeof value === "string");
-		}
-	}
-
-	return [];
-}
-
-async function fetchPermittedModelNames(accessToken: string, config: HawkConfig): Promise<string[]> {
+async function fetchPermittedModelEntries(accessToken: string, config: HawkConfig): Promise<PermittedModelEntry[]> {
 	const url = `${config.middlemanBaseUrl}/permitted_models`;
 	debugLog("Fetching permitted Hawk models", { url });
 	const response = await fetch(url, {
@@ -440,18 +534,18 @@ async function fetchPermittedModelNames(accessToken: string, config: HawkConfig)
 	}
 
 	const payload = parseJson<unknown>(text);
-	const names = extractPermittedModelNames(payload);
-	debugLog("Received permitted model names", {
-		count: names.length,
-		sample: names.slice(0, 20),
+	const entries = extractPermittedModelEntries(payload);
+	debugLog("Received permitted model entries", {
+		count: entries.length,
+		sample: entries.slice(0, 20),
 	});
-	return names;
+	return entries;
 }
 
 async function tryDiscoverModels(accessToken: string, config: HawkConfig, onProgress?: (message: string) => void): Promise<void> {
 	onProgress?.("Discovering Hawk models...");
-	const names = await fetchPermittedModelNames(accessToken, config);
-	const discoveredModels = buildDiscoveredModels(names);
+	const entries = await fetchPermittedModelEntries(accessToken, config);
+	const discoveredModels = buildDiscoveredModels(entries);
 	debugLog("Built discovered Hawk models", {
 		count: discoveredModels.length,
 		sample: discoveredModels.slice(0, 20).map((model) => ({
@@ -459,6 +553,7 @@ async function tryDiscoverModels(accessToken: string, config: HawkConfig, onProg
 			backend: model.backend,
 			upstreamModel: model.upstreamModel,
 			openaiApi: model.openaiApi,
+			anthropicSpeed: model.anthropicSpeed,
 		})),
 	});
 	if (discoveredModels.length === 0) {
@@ -716,6 +811,7 @@ export function streamHawk(
 	debugLog("Routing Hawk Anthropic request", {
 		model: model.id,
 		upstreamModel: modelConfig.upstreamModel,
+		speed: modelConfig.anthropicSpeed,
 		baseUrl: config.anthropicBaseUrl,
 	});
 	const anthropicModel: Model<"anthropic-messages"> = {
@@ -727,6 +823,7 @@ export function streamHawk(
 	return streamSimpleAnthropic(anthropicModel, context, {
 		...(options ?? {}),
 		apiKey: accessToken,
+		speed: modelConfig.anthropicSpeed,
 		headers: {
 			...(options?.headers ?? {}),
 			Authorization: `Bearer ${accessToken}`,
