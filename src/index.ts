@@ -780,6 +780,9 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 
 	pi.registerProvider("hawk", {
 		baseUrl: config.middlemanBaseUrl,
+		headers: {
+			"x-middleman-priority": "high"
+		},
 		apiKey: "HAWK_ACCESS_TOKEN",
 		api: "hawk",
 		models: providerModels,
