@@ -127,9 +127,22 @@ interface HawkConfig {
 	headers?: Record<string, string>;
 }
 
+interface ExtraModelConfig {
+	id: string;
+	name?: string;
+	backend: HawkBackend;
+	openaiApi?: "openai-completions" | "openai-responses";
+	reasoning?: boolean;
+	input?: ("text" | "image")[];
+	contextWindow?: number;
+	maxTokens?: number;
+	cost?: { input: number; output: number; cacheRead: number; cacheWrite: number };
+}
+
 interface HawkProviderOverride {
 	baseUrl?: string;
 	headers?: Record<string, string>;
+	extraModels?: ExtraModelConfig[];
 }
 
 interface DeviceCodeResponse {
@@ -211,14 +224,59 @@ function readHawkProviderOverride(): HawkProviderOverride {
 			}
 		}
 
+		const extraModels = parseExtraModels(entry.extraModels);
+
 		return {
 			baseUrl: typeof entry.baseUrl === "string" && entry.baseUrl.trim().length > 0 ? entry.baseUrl.trim() : undefined,
 			headers: Object.keys(resolvedHeaders).length > 0 ? resolvedHeaders : undefined,
+			extraModels: extraModels.length > 0 ? extraModels : undefined,
 		};
 	} catch (error) {
 		debugLog("Failed to read Hawk override from models.json", error);
 		return {};
 	}
+}
+
+function parseExtraModels(raw: unknown): ExtraModelConfig[] {
+	if (!Array.isArray(raw)) return [];
+	const result: ExtraModelConfig[] = [];
+	for (const item of raw) {
+		if (!item || typeof item !== "object") continue;
+		const entry = item as Record<string, unknown>;
+		const id = entry.id;
+		const backend = entry.backend;
+		if (typeof id !== "string" || id.length === 0) continue;
+		if (backend !== "openai" && backend !== "anthropic") continue;
+
+		const openaiApi = entry.openaiApi;
+		const validOpenaiApi =
+			openaiApi === "openai-completions" || openaiApi === "openai-responses" ? openaiApi : undefined;
+
+		result.push({
+			id,
+			name: typeof entry.name === "string" ? entry.name : undefined,
+			backend,
+			openaiApi: backend === "openai" ? (validOpenaiApi ?? "openai-completions") : undefined,
+			reasoning: typeof entry.reasoning === "boolean" ? entry.reasoning : false,
+			input: Array.isArray(entry.input) ? entry.input.filter((v: unknown) => v === "text" || v === "image") : ["text", "image"],
+			contextWindow: typeof entry.contextWindow === "number" ? entry.contextWindow : 200_000,
+			maxTokens: typeof entry.maxTokens === "number" ? entry.maxTokens : 32_000,
+			cost: parseCost(entry.cost),
+		});
+	}
+	return result;
+}
+
+function parseCost(raw: unknown): { input: number; output: number; cacheRead: number; cacheWrite: number } {
+	const defaultCost = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+	if (!raw || typeof raw !== "object") return defaultCost;
+	const c = raw as Record<string, unknown>;
+	return {
+		input: typeof c.input === "number" ? c.input : 0,
+		output: typeof c.output === "number" ? c.output : 0,
+		cacheRead: typeof c.cacheRead === "number" ? c.cacheRead : 0,
+		cacheWrite: typeof c.cacheWrite === "number" ? c.cacheWrite : 0,
+	};
 }
 
 function readStoredHawkCredentials(): OAuthCredentials | undefined {
@@ -327,7 +385,39 @@ function toProviderModelConfig(model: HawkModelConfig): ProviderModelConfig {
 
 function replaceRuntimeModels(models: HawkModelConfig[]): void {
 	runtimeModels.splice(0, runtimeModels.length, ...models);
-	providerModels.splice(0, providerModels.length, ...models.map(toProviderModelConfig));
+	appendExtraModelsToRuntime();
+	providerModels.splice(0, providerModels.length, ...runtimeModels.map(toProviderModelConfig));
+}
+
+function extraModelToHawkModelConfig(extra: ExtraModelConfig): HawkModelConfig {
+	return {
+		id: extra.id,
+		name: extra.name ?? `${extra.id} (Hawk)`,
+		backend: extra.backend,
+		upstreamModel: extra.id,
+		openaiApi: extra.openaiApi,
+		reasoning: extra.reasoning ?? false,
+		input: extra.input ?? ["text", "image"],
+		contextWindow: extra.contextWindow ?? 200_000,
+		maxTokens: extra.maxTokens ?? 32_000,
+		cost: extra.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+	};
+}
+
+function appendExtraModelsToRuntime(): void {
+	const override = readHawkProviderOverride();
+	if (!override.extraModels || override.extraModels.length === 0) return;
+
+	const existingIds = new Set(runtimeModels.map((m) => m.id));
+	for (const extra of override.extraModels) {
+		if (existingIds.has(extra.id)) {
+			debugLog("Extra model skipped (already discovered)", { id: extra.id });
+			continue;
+		}
+		const hawkModel = extraModelToHawkModelConfig(extra);
+		runtimeModels.push(hawkModel);
+		debugLog("Added extra model from config", { id: hawkModel.id, backend: hawkModel.backend });
+	}
 }
 
 function extractUpstreamModel(name: string): { backend: HawkBackend; upstreamModel: string } | null {
