@@ -58,6 +58,25 @@ If both OAuth and env token are available, pi credential priority rules apply.
 
 All settings are optional.
 
+The extension also reads provider-level `hawk` overrides from `~/.pi/agent/models.json` and honors:
+
+- `baseUrl`
+- `headers`
+
+Example:
+
+```json
+{
+  "providers": {
+    "hawk": {
+      "headers": {
+        "x-middleman-priority": "high"
+      }
+    }
+  }
+}
+```
+
 - `HAWK_ISSUER` (default: `https://metr.okta.com/oauth2/aus1ww3m0x41jKp3L1d8/`)
 - `HAWK_CLIENT_ID` (default: `0oa1wxy3qxaHOoGxG1d8`)
 - `HAWK_AUDIENCE` (default: `https://model-poking-3`)
