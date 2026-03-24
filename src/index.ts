@@ -66,6 +66,7 @@ interface ProviderConfig {
 	baseUrl?: string;
 	apiKey?: string;
 	api?: string;
+	headers?: Record<string, string>;
 	models?: ProviderModelConfig[];
 	oauth?: {
 		name: string;
@@ -123,6 +124,12 @@ interface HawkConfig {
 	middlemanBaseUrl: string;
 	openaiBaseUrl: string;
 	anthropicBaseUrl: string;
+	headers?: Record<string, string>;
+}
+
+interface HawkProviderOverride {
+	baseUrl?: string;
+	headers?: Record<string, string>;
 }
 
 interface DeviceCodeResponse {
@@ -155,13 +162,63 @@ function env(name: string, fallback: string): string {
 	return value && value.trim().length > 0 ? value.trim() : fallback;
 }
 
-function getAuthFilePath(): string {
+function getAgentDirPath(): string {
 	const configuredAgentDir = process.env.PI_CODING_AGENT_DIR;
-	const agentDir =
-		typeof configuredAgentDir === "string" && configuredAgentDir.trim().length > 0
-			? configuredAgentDir.trim()
-			: join(homedir(), ".pi", "agent");
-	return join(agentDir, "auth.json");
+	return typeof configuredAgentDir === "string" && configuredAgentDir.trim().length > 0
+		? configuredAgentDir.trim()
+		: join(homedir(), ".pi", "agent");
+}
+
+function getAuthFilePath(): string {
+	return join(getAgentDirPath(), "auth.json");
+}
+
+function getModelsFilePath(): string {
+	return join(getAgentDirPath(), "models.json");
+}
+
+function readHawkProviderOverride(): HawkProviderOverride {
+	try {
+		const modelsPath = getModelsFilePath();
+		if (!existsSync(modelsPath)) {
+			return {};
+		}
+
+		const raw = readFileSync(modelsPath, "utf-8");
+		const parsed = parseJson<unknown>(raw);
+		if (!parsed || typeof parsed !== "object") {
+			return {};
+		}
+
+		const providers = (parsed as Record<string, unknown>).providers;
+		if (!providers || typeof providers !== "object") {
+			return {};
+		}
+
+		const hawkEntry = (providers as Record<string, unknown>).hawk;
+		if (!hawkEntry || typeof hawkEntry !== "object") {
+			return {};
+		}
+
+		const entry = hawkEntry as Record<string, unknown>;
+		const headers = entry.headers;
+		const resolvedHeaders: Record<string, string> = {};
+		if (headers && typeof headers === "object") {
+			for (const [key, value] of Object.entries(headers)) {
+				if (typeof value === "string") {
+					resolvedHeaders[key] = value;
+				}
+			}
+		}
+
+		return {
+			baseUrl: typeof entry.baseUrl === "string" && entry.baseUrl.trim().length > 0 ? entry.baseUrl.trim() : undefined,
+			headers: Object.keys(resolvedHeaders).length > 0 ? resolvedHeaders : undefined,
+		};
+	} catch (error) {
+		debugLog("Failed to read Hawk override from models.json", error);
+		return {};
+	}
 }
 
 function readStoredHawkCredentials(): OAuthCredentials | undefined {
@@ -208,7 +265,11 @@ function readStoredHawkCredentials(): OAuthCredentials | undefined {
 }
 
 function getConfig(): HawkConfig {
-	const middlemanBaseUrl = env("HAWK_MIDDLEMAN_BASE_URL", DEFAULT_MIDDLEMAN_BASE_URL).replace(/\/+$/, "");
+	const providerOverride = readHawkProviderOverride();
+	const middlemanBaseUrl = env("HAWK_MIDDLEMAN_BASE_URL", providerOverride.baseUrl ?? DEFAULT_MIDDLEMAN_BASE_URL).replace(
+		/\/+$/,
+		"",
+	);
 	const openaiBaseUrl = env("HAWK_OPENAI_BASE_URL", `${middlemanBaseUrl}/${DEFAULT_OPENAI_ROUTE}`);
 	const anthropicBaseUrl = env("HAWK_ANTHROPIC_BASE_URL", `${middlemanBaseUrl}/${DEFAULT_ANTHROPIC_ROUTE}`);
 
@@ -222,6 +283,7 @@ function getConfig(): HawkConfig {
 		middlemanBaseUrl,
 		openaiBaseUrl,
 		anthropicBaseUrl,
+		headers: providerOverride.headers,
 	};
 }
 
@@ -448,6 +510,7 @@ async function fetchPermittedModelNames(accessToken: string, config: HawkConfig)
 		headers: {
 			"Content-Type": "application/json",
 			Accept: "application/json",
+			...(config.headers ?? {}),
 		},
 		body: JSON.stringify({
 			api_key: accessToken,
@@ -782,6 +845,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		baseUrl: config.middlemanBaseUrl,
 		apiKey: "HAWK_ACCESS_TOKEN",
 		api: "hawk",
+		headers: config.headers,
 		models: providerModels,
 		oauth: {
 			name: "Hawk",
