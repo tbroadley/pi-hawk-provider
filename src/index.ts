@@ -97,6 +97,7 @@ interface HawkModelConfig {
 	contextWindow: number;
 	maxTokens: number;
 	cost: { input: number; output: number; cacheRead: number; cacheWrite: number };
+	headers?: Record<string, string>;
 }
 
 const runtimeModels: HawkModelConfig[] = [];
@@ -137,6 +138,7 @@ interface ExtraModelConfig {
 	contextWindow?: number;
 	maxTokens?: number;
 	cost?: { input: number; output: number; cacheRead: number; cacheWrite: number };
+	headers?: Record<string, string>;
 }
 
 interface HawkProviderOverride {
@@ -214,21 +216,11 @@ function readHawkProviderOverride(): HawkProviderOverride {
 		}
 
 		const entry = hawkEntry as Record<string, unknown>;
-		const headers = entry.headers;
-		const resolvedHeaders: Record<string, string> = {};
-		if (headers && typeof headers === "object") {
-			for (const [key, value] of Object.entries(headers)) {
-				if (typeof value === "string") {
-					resolvedHeaders[key] = value;
-				}
-			}
-		}
-
 		const extraModels = parseExtraModels(entry.extraModels);
 
 		return {
 			baseUrl: typeof entry.baseUrl === "string" && entry.baseUrl.trim().length > 0 ? entry.baseUrl.trim() : undefined,
-			headers: Object.keys(resolvedHeaders).length > 0 ? resolvedHeaders : undefined,
+			headers: parseHeaders(entry.headers),
 			extraModels: extraModels.length > 0 ? extraModels : undefined,
 		};
 	} catch (error) {
@@ -252,6 +244,8 @@ function parseExtraModels(raw: unknown): ExtraModelConfig[] {
 		const validOpenaiApi =
 			openaiApi === "openai-completions" || openaiApi === "openai-responses" ? openaiApi : undefined;
 
+		const modelHeaders = parseHeaders(entry.headers);
+
 		result.push({
 			id,
 			name: typeof entry.name === "string" ? entry.name : undefined,
@@ -262,9 +256,21 @@ function parseExtraModels(raw: unknown): ExtraModelConfig[] {
 			contextWindow: typeof entry.contextWindow === "number" ? entry.contextWindow : 200_000,
 			maxTokens: typeof entry.maxTokens === "number" ? entry.maxTokens : 32_000,
 			cost: parseCost(entry.cost),
+			headers: modelHeaders,
 		});
 	}
 	return result;
+}
+
+function parseHeaders(raw: unknown): Record<string, string> | undefined {
+	if (!raw || typeof raw !== "object") return undefined;
+	const result: Record<string, string> = {};
+	for (const [key, value] of Object.entries(raw)) {
+		if (typeof value === "string") {
+			result[key] = value;
+		}
+	}
+	return Object.keys(result).length > 0 ? result : undefined;
 }
 
 function parseCost(raw: unknown): { input: number; output: number; cacheRead: number; cacheWrite: number } {
@@ -401,6 +407,7 @@ function extraModelToHawkModelConfig(extra: ExtraModelConfig): HawkModelConfig {
 		contextWindow: extra.contextWindow ?? 200_000,
 		maxTokens: extra.maxTokens ?? 32_000,
 		cost: extra.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		headers: extra.headers,
 	};
 }
 
@@ -876,6 +883,10 @@ export function streamHawk(
 			baseUrl: config.openaiBaseUrl,
 		});
 
+		const openaiHeaders = modelConfig.headers
+			? { ...(options?.headers ?? {}), ...modelConfig.headers }
+			: options?.headers;
+
 		if (openaiApi === "openai-responses") {
 			const openaiModel: Model<"openai-responses"> = {
 				...model,
@@ -886,6 +897,7 @@ export function streamHawk(
 			return streamSimpleOpenAIResponses(openaiModel, context, {
 				...(options ?? {}),
 				apiKey: accessToken,
+				...(openaiHeaders ? { headers: openaiHeaders } : {}),
 			});
 		}
 
@@ -898,6 +910,7 @@ export function streamHawk(
 		return streamSimpleOpenAICompletions(openaiModel, context, {
 			...(options ?? {}),
 			apiKey: accessToken,
+			...(openaiHeaders ? { headers: openaiHeaders } : {}),
 		});
 	}
 
@@ -919,6 +932,7 @@ export function streamHawk(
 		speed: modelConfig.anthropicSpeed,
 		headers: {
 			...(options?.headers ?? {}),
+			...(modelConfig.headers ?? {}),
 			Authorization: `Bearer ${accessToken}`,
 		},
 	});
