@@ -1,6 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import {
 	type Api,
 	type AssistantMessageEventStream,
@@ -389,6 +389,94 @@ function toProviderModelConfig(model: HawkModelConfig): ProviderModelConfig {
 	};
 }
 
+/**
+ * Find the .allowed-agents file by walking up from startDir.
+ * Returns the file path, or undefined if not found.
+ */
+function findAllowedAgentsFile(startDir: string): string | undefined {
+	let dir = startDir;
+	while (true) {
+		const candidate = join(dir, ".allowed-agents");
+		if (existsSync(candidate)) {
+			return candidate;
+		}
+		const parent = dirname(dir);
+		if (parent === dir) break;
+		dir = parent;
+	}
+	return undefined;
+}
+
+/**
+ * Read model filter globs for "pi" from .allowed-agents.
+ * Returns an array of glob patterns, or undefined if no restrictions.
+ *
+ * Syntax in .allowed-agents:
+ *   pi              → no model restrictions (returns undefined)
+ *   pi[claude*]     → restrict to models matching "claude*"
+ *   pi[claude*,gpt*] → restrict to models matching "claude*" or "gpt*"
+ */
+function readModelFilters(startDir: string): string[] | undefined {
+	const filePath = findAllowedAgentsFile(startDir);
+	if (!filePath) return undefined;
+
+	try {
+		const content = readFileSync(filePath, "utf-8");
+		const lines = content.split("\n").map((l) => l.trim()).filter((l) => l.length > 0 && !l.startsWith("#"));
+
+		for (const line of lines) {
+			const match = line.match(/^pi\[(.+)\]$/);
+			if (match && match[1]) {
+				const filters = match[1].split(",").map((f) => f.trim()).filter((f) => f.length > 0);
+				if (filters.length > 0) {
+					debugLog("Model filters from .allowed-agents", { filePath, filters });
+					return filters;
+				}
+			}
+		}
+	} catch (error) {
+		debugLog("Failed to read .allowed-agents for model filters", error);
+	}
+
+	return undefined;
+}
+
+/**
+ * Test whether a model ID matches a glob pattern.
+ * Supports * (any chars) and ? (single char).
+ */
+function globMatch(pattern: string, text: string): boolean {
+	const regexStr = pattern
+		.replace(/[.+^${}()|[\]\\]/g, "\\$&")
+		.replace(/\*/g, ".*")
+		.replace(/\?/g, ".");
+	return new RegExp(`^${regexStr}$`, "i").test(text);
+}
+
+/**
+ * Filter models based on glob patterns from .allowed-agents.
+ * If no filters are configured, returns models unchanged.
+ */
+function applyModelFilters(models: HawkModelConfig[]): HawkModelConfig[] {
+	const cwd = process.cwd();
+	const filters = readModelFilters(cwd);
+	if (!filters) return models;
+
+	const filtered = models.filter((model) =>
+		filters.some((pattern) => globMatch(pattern, model.id) || globMatch(pattern, model.upstreamModel)),
+	);
+
+	debugLog("Applied model filters", {
+		cwd,
+		filters,
+		before: models.length,
+		after: filtered.length,
+		kept: filtered.map((m) => m.id),
+	});
+
+	return filtered;
+}
+
 function replaceRuntimeModels(models: HawkModelConfig[]): void {
 	runtimeModels.splice(0, runtimeModels.length, ...models);
 	appendExtraModelsToRuntime();
@@ -659,8 +747,12 @@ async function tryDiscoverModels(accessToken: string, config: HawkConfig, onProg
 	if (discoveredModels.length === 0) {
 		throw new Error("No OpenAI/Anthropic-compatible models found in Hawk permitted model list");
 	}
-	replaceRuntimeModels(discoveredModels);
-	onProgress?.(`Discovered ${discoveredModels.length} Hawk models`);
+	const filteredModels = applyModelFilters(discoveredModels);
+	if (filteredModels.length === 0) {
+		throw new Error("All discovered Hawk models were excluded by .allowed-agents model filters");
+	}
+	replaceRuntimeModels(filteredModels);
+	onProgress?.(`Discovered ${filteredModels.length} Hawk models`);
 }
 
 async function startDeviceCodeFlow(config: HawkConfig): Promise<DeviceCodeResponse> {
