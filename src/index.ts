@@ -85,6 +85,15 @@ interface ProviderConfig {
 
 interface ExtensionAPI {
 	registerProvider(name: string, config: ProviderConfig): void;
+	/**
+	 * Pi's shared event bus. Other extensions emit/listen on string channels.
+	 * We use it to expose Hawk's access token to pi-cas-provider's relay
+	 * contract (see `pi-cas:relay-request` handler at the bottom of this file).
+	 */
+	events: {
+		emit(channel: string, data: unknown): void;
+		on(channel: string, handler: (data: unknown) => void): () => void;
+	};
 }
 
 interface HawkModelConfig {
@@ -875,4 +884,80 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		},
 		streamSimple: streamHawk,
 	});
+
+	registerRelayListener(pi);
+}
+
+/**
+ * Listen for `pi-cas:relay-request` and answer with our access token +
+ * Anthropic relay base URL.
+ *
+ * Contract is defined in pi-cas-provider/src/relay.ts. Summary:
+ *   - We receive `{ requestId, preferredProvider? }` on `pi-cas:relay-request`.
+ *   - If `preferredProvider` is set and isn't "hawk", we stay silent (don't
+ *     even respond with ok:false — the requester is pinning a specific peer
+ *     and we don't want to race with bid wars).
+ *   - Otherwise we refresh the access token if needed and emit
+ *     `pi-cas:relay-response` with `{ requestId, ok, provider: "hawk",
+ *     baseUrl, accessToken }` or `{ ok: false, error }` on failure.
+ *
+ * The handler is fire-and-forget: pi.events.emit doesn't await, and the
+ * requester has its own timeout, so a long refresh just means a timeout
+ * on their end rather than a hung promise here.
+ */
+function registerRelayListener(pi: ExtensionAPI): void {
+	const REQUEST_CHANNEL = "pi-cas:relay-request";
+	const RESPONSE_CHANNEL = "pi-cas:relay-response";
+	const PROVIDER_NAME = "hawk";
+
+	pi.events.on(REQUEST_CHANNEL, (raw) => {
+		if (!raw || typeof raw !== "object") return;
+		const req = raw as { requestId?: unknown; preferredProvider?: unknown };
+		if (typeof req.requestId !== "string") return;
+		if (typeof req.preferredProvider === "string" && req.preferredProvider !== PROVIDER_NAME) {
+			// Pinned to someone else; stay quiet.
+			return;
+		}
+		const requestId = req.requestId;
+
+		// Fire-and-forget the refresh + emit.
+		(async () => {
+			let token: string | undefined;
+			let error: string | undefined;
+			try {
+				const config = getConfig();
+				token = await getStartupAccessToken(config);
+				if (!token) {
+					error =
+						"No Hawk access token available. Run `/login hawk` (or set HAWK_ACCESS_TOKEN).";
+				}
+			} catch (err) {
+				error = err instanceof Error ? err.message : String(err);
+			}
+
+			if (!token) {
+				debugLog(`Relay request ${requestId} — responding ok:false: ${error}`);
+				pi.events.emit(RESPONSE_CHANNEL, {
+					requestId,
+					ok: false,
+					provider: PROVIDER_NAME,
+					error: error ?? "unknown error",
+				});
+				return;
+			}
+
+			// `getConfig()` is cheap; re-read so the URL reflects any env changes.
+			const { anthropicBaseUrl } = getConfig();
+			debugLog(`Relay request ${requestId} — responding with ${anthropicBaseUrl}`);
+			pi.events.emit(RESPONSE_CHANNEL, {
+				requestId,
+				ok: true,
+				provider: PROVIDER_NAME,
+				baseUrl: anthropicBaseUrl,
+				accessToken: token,
+			});
+		})();
+	});
+
+	debugLog("Registered pi-cas:relay-request listener");
 }
