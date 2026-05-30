@@ -35,6 +35,7 @@ declare module "@mariozechner/pi-ai" {
 		contextWindow: number;
 		maxTokens: number;
 		headers?: Record<string, string>;
+		compat?: { forceAdaptiveThinking?: boolean };
 	}
 
 	export interface Context {

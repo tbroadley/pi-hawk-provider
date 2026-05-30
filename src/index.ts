@@ -13,6 +13,8 @@ import {
 	streamSimpleOpenAIResponses,
 	type ThinkingLevelMap,
 } from "@mariozechner/pi-ai";
+import { type FastModeProxyHandle, MARKER_HEADER as FAST_MODE_MARKER_HEADER, startFastModeProxy } from "./fast-mode-proxy.js";
+import { loadState, saveState, statePath } from "./state.js";
 
 const DEFAULT_ISSUER = "https://metr.okta.com/oauth2/aus1ww3m0x41jKp3L1d8/";
 const DEFAULT_CLIENT_ID = "0oa1wxy3qxaHOoGxG1d8";
@@ -83,6 +85,13 @@ interface ProviderConfig {
 	) => AssistantMessageEventStream;
 }
 
+/** Minimal slash-command context we need (mirrors pi-coding-agent's ExtensionCommandContext). */
+interface SlashCommandContext {
+	ui: {
+		notify(text: string, kind?: "info" | "warning" | "error"): void;
+	};
+}
+
 interface ExtensionAPI {
 	registerProvider(name: string, config: ProviderConfig): void;
 	/**
@@ -94,6 +103,21 @@ interface ExtensionAPI {
 		emit(channel: string, data: unknown): void;
 		on(channel: string, handler: (data: unknown) => void): () => void;
 	};
+	/**
+	 * Register a slash command. The full pi-coding-agent type accepts
+	 * `getArgumentCompletions` etc.; we only need name + description + handler
+	 * for `/fast`, so the shape is reduced.
+	 */
+	registerCommand(
+		name: string,
+		options: {
+			description?: string;
+			getArgumentCompletions?: (
+				prefix: string,
+			) => Array<{ value: string; label: string }> | null;
+			handler: (args: string, ctx: SlashCommandContext) => Promise<void> | void;
+		},
+	): void;
 }
 
 interface HawkModelConfig {
@@ -102,17 +126,77 @@ interface HawkModelConfig {
 	backend: HawkBackend;
 	upstreamModel: string;
 	openaiApi?: "openai-completions" | "openai-responses";
-	anthropicSpeed?: "fast";
 	reasoning: boolean;
 	thinkingLevelMap?: ThinkingLevelMap;
 	input: ("text" | "image")[];
 	contextWindow: number;
 	maxTokens: number;
 	cost: { input: number; output: number; cacheRead: number; cacheWrite: number };
+	compat?: { forceAdaptiveThinking?: boolean };
 }
 
 const runtimeModels: HawkModelConfig[] = [];
 const providerModels: ProviderModelConfig[] = [];
+
+/**
+ * Handle for the in-extension fast-mode injection proxy. Set during
+ * extension load (best-effort); read by `streamHawk` to decide whether
+ * to route Anthropic traffic via the proxy and whether to flip the
+ * marker header. `undefined` means the proxy isn't running — fast-tier
+ * models silently downgrade to standard tier in that case.
+ */
+let fastModeProxy: FastModeProxyHandle | undefined;
+
+/**
+ * Reference to the live `pi` API, captured at extension load so non-default
+ * functions (like `streamHawk`) can publish events. Cleared if we ever wire
+ * up shutdown.
+ */
+let piRef: ExtensionAPI | undefined;
+
+/**
+ * Global fast-mode toggle. When true, `streamHawk` sets the marker header
+ * on requests for fast-mode-capable Anthropic models (Opus 4.6 / 4.7 / 4.8)
+ * and the in-extension proxy injects `body.speed = "fast"` plus the
+ * `fast-mode-2026-02-01` beta. Always emits as standard tier on any other
+ * model regardless of this flag — the user picks the model via the model
+ * picker; this flag chooses tier per-call when the model supports it.
+ *
+ * Initial value resolves with precedence:
+ *   1. `HAWK_FAST_MODE` env var ("1"/"true" → on, "0"/"false" → off)
+ *   2. Persisted preference in `~/.pi/agent/hawk-state.json` (set via `/fast on|off`)
+ *   3. false
+ *
+ * Env wins over persisted on purpose: per-launch override without rewriting
+ * the saved value. Same convention as pi-cas-provider's `PI_CAS_FAST_MODE`.
+ */
+let fastModeEnabled: boolean = resolveInitialFastMode();
+
+function resolveInitialFastMode(): boolean {
+	const env = process.env.HAWK_FAST_MODE;
+	if (env === "1" || env === "true") return true;
+	if (env === "0" || env === "false") return false;
+	return loadState().fastMode === true;
+}
+
+/**
+ * Channel + payload shape consumed by pi-vim's fast-mode glyph (and by any
+ * other UI that wants the same indicator). Originally defined by
+ * pi-cas-provider; pi-vim explicitly treats it as publisher-agnostic. We
+ * mirror the payload shape here so the badge "just works" for hawk's
+ * `*-fast` model variants too.
+ *   { intent: boolean, actual?: "on"|"off"|"cooldown", model?: string }
+ */
+const FAST_MODE_BADGE_CHANNEL = "pi:fast-mode" as const;
+function publishFastModeBadge(payload: {
+	intent: boolean;
+	actual?: "on" | "off" | "cooldown";
+	model?: string;
+}): void {
+	const pi = piRef;
+	if (!pi || typeof pi.events?.emit !== "function") return;
+	pi.events.emit(FAST_MODE_BADGE_CHANNEL, payload);
+}
 
 function loadBuiltInModels(provider: string): Map<string, Model<Api>> {
 	try {
@@ -415,20 +499,23 @@ function resolvedOpenAIApiFromBuiltIn(model: Model<Api>): "openai-completions" |
 	return undefined;
 }
 
-function supportsAnthropicFastMode(modelId: string): boolean {
-	return modelId.toLowerCase() === "claude-opus-4-6";
-}
-
-/** Anthropic fast mode is priced at 6x standard rates across the full context window. */
-const ANTHROPIC_FAST_MODE_COST_MULTIPLIER = 6;
-
-function applyFastModeCost(cost: HawkModelConfig["cost"]): HawkModelConfig["cost"] {
-	return {
-		input: cost.input * ANTHROPIC_FAST_MODE_COST_MULTIPLIER,
-		output: cost.output * ANTHROPIC_FAST_MODE_COST_MULTIPLIER,
-		cacheRead: cost.cacheRead * ANTHROPIC_FAST_MODE_COST_MULTIPLIER,
-		cacheWrite: cost.cacheWrite * ANTHROPIC_FAST_MODE_COST_MULTIPLIER,
-	};
+/**
+ * Models on which Anthropic's fast tier is available. Used as the per-turn
+ * gate inside `streamHawk`: even when the global `fastModeEnabled` toggle is
+ * on, we only flip the marker header on requests for these models. Anything
+ * else (Sonnet, Haiku, OpenAI) silently passes through standard tier so the
+ * toggle is a no-op for them.
+ *
+ * Kept in sync with `FAST_MODEL_PREFIXES` in `src/fast-mode-proxy.ts` —
+ * those are the prefixes the proxy will inject for.
+ */
+function isFastModeCapableModel(modelId: string): boolean {
+	const id = modelId.toLowerCase();
+	return (
+		id === "claude-opus-4-6" ||
+		id === "claude-opus-4-7" ||
+		id === "claude-opus-4-8"
+	);
 }
 
 function extractPermittedModelNames(payload: unknown): string[] {
@@ -497,6 +584,11 @@ function buildDiscoveredModels(permittedModelNames: string[]): HawkModelConfig[]
 			contextWindow: builtIn.contextWindow,
 			maxTokens: builtIn.maxTokens,
 			cost: builtIn.cost,
+			// pi-ai >=0.76 gates adaptive-thinking on `compat.forceAdaptiveThinking`
+			// (no longer auto-detected from id). Carry it through so streamHawk can
+			// pass it to streamSimpleAnthropic; without it, Opus 4.7 rejects the
+			// request with `thinking.type.enabled is not supported for this model`.
+			...(builtIn.compat ? { compat: builtIn.compat } : {}),
 		} satisfies Omit<HawkModelConfig, "id" | "name">;
 
 		models.push({
@@ -505,18 +597,11 @@ function buildDiscoveredModels(permittedModelNames: string[]): HawkModelConfig[]
 			...shared,
 		});
 
-		const enableAnthropicFastMode =
-			backend === "anthropic" &&
-			(supportsAnthropicFastMode(upstreamModel) || supportsAnthropicFastMode(builtIn.id));
-		if (enableAnthropicFastMode) {
-			models.push({
-				id: `${upstreamModel}-fast`,
-				name: `${builtIn.name} (Hawk) (fast)`,
-				anthropicSpeed: "fast",
-				...shared,
-				cost: applyFastModeCost(shared.cost),
-			});
-		}
+		// Fast-mode used to be exposed as a parallel `${upstreamModel}-fast`
+		// model variant; replaced by the global `/fast on|off` toggle.
+		// Capability check is now per-turn in `streamHawk` via
+		// `isFastModeCapableModel`. Cost is reported as standard tier in the
+		// picker — the `/fast on` handler warns about the ~6× multiplier.
 	}
 
 	models.sort((a, b) => {
@@ -570,7 +655,6 @@ async function tryDiscoverModels(accessToken: string, config: HawkConfig, onProg
 			backend: model.backend,
 			upstreamModel: model.upstreamModel,
 			openaiApi: model.openaiApi,
-			anthropicSpeed: model.anthropicSpeed,
 		})),
 	});
 	if (discoveredModels.length === 0) {
@@ -793,6 +877,10 @@ export function streamHawk(
 		if (!openaiApi) {
 			throw new Error(`No built-in OpenAI api mapping for model: ${model.id}`);
 		}
+		// Clear the fast-mode badge: OpenAI models never participate in
+		// Anthropic's fast-tier service. If a prior turn lit the glyph, this
+		// turn extinguishes it.
+		publishFastModeBadge({ intent: false, model: modelConfig.id });
 		debugLog("Routing Hawk OpenAI request", {
 			model: model.id,
 			upstreamModel: modelConfig.upstreamModel,
@@ -825,27 +913,78 @@ export function streamHawk(
 		});
 	}
 
+	// Route Anthropic traffic via the local fast-mode proxy when it's running.
+	// The proxy injects `body.speed = "fast"` + the `fast-mode-2026-02-01`
+	// beta header on requests that bear the marker header below. Non-marker
+	// requests pass through unchanged, so this is also safe for non-fast
+	// models. If the proxy failed to start at extension load, fall back to
+	// the direct middleman URL — fast-tier models then silently downgrade to
+	// standard tier (matches pre-proxy behavior).
+	const modelSupportsFast = isFastModeCapableModel(modelConfig.upstreamModel);
+	const useFastMode = fastModeEnabled && modelSupportsFast;
+
+	// When the user has fast mode enabled but picked a model that doesn't
+	// support it, surface a per-request warning so it's obvious why fast
+	// tier isn't kicking in. Don't suppress on repeats — they may have
+	// just switched models and want immediate feedback.
+	if (fastModeEnabled && !modelSupportsFast) {
+		console.warn(
+			`[pi-hawk-provider] /fast is ON but ${modelConfig.upstreamModel} doesn't support ` +
+				`Anthropic fast tier — running this turn as standard. ` +
+				`Pick claude-opus-4-6, -4-7, or -4-8 to use fast mode.`,
+		);
+	}
+
+	// Publish badge state for pi-vim (and any other consumer of
+	// `pi:fast-mode`). When useFastMode is false we still emit so the
+	// badge clears on every non-fast turn — otherwise a stale "on" from a
+	// previous turn (or from pi-cas-provider in the same session) would
+	// linger. When useFastMode is true we report "on" if the proxy is up
+	// (injection will happen) or "off" if it isn't (silent downgrade).
+	publishFastModeBadge({
+		intent: useFastMode,
+		actual: useFastMode ? (fastModeProxy ? "on" : "off") : undefined,
+		model: modelConfig.id,
+	});
+
+	const upstreamBaseUrl = fastModeProxy?.getBaseUrl() ?? config.anthropicBaseUrl;
+	if (fastModeProxy) {
+		// Keep the proxy in sync if the middleman URL was rotated since startup.
+		fastModeProxy.setUpstreamBaseUrl(config.anthropicBaseUrl);
+	}
+
 	debugLog("Routing Hawk Anthropic request", {
 		model: model.id,
 		upstreamModel: modelConfig.upstreamModel,
-		speed: modelConfig.anthropicSpeed,
+		fastModeEnabled,
+		modelSupportsFast,
 		thinkingLevelMap: modelConfig.thinkingLevelMap,
-		baseUrl: config.anthropicBaseUrl,
+		baseUrl: upstreamBaseUrl,
+		viaFastModeProxy: fastModeProxy ? true : false,
+		fastModeWillBeInjected: useFastMode && !!fastModeProxy,
 	});
+
 	const anthropicModel: Model<"anthropic-messages"> = {
 		...model,
 		id: modelConfig.upstreamModel,
 		api: "anthropic-messages",
-		baseUrl: config.anthropicBaseUrl,
+		baseUrl: upstreamBaseUrl,
 		...(modelConfig.thinkingLevelMap ? { thinkingLevelMap: modelConfig.thinkingLevelMap } : {}),
+		// Required by pi-ai >=0.76 to route Opus 4.6/4.7 through adaptive thinking
+		// instead of the legacy `thinking.type=enabled` shape (which Opus 4.7 rejects).
+		...(modelConfig.compat ? { compat: modelConfig.compat } : {}),
 	};
 	return streamSimpleAnthropic(anthropicModel, context, {
 		...(options ?? {}),
 		apiKey: accessToken,
-		speed: modelConfig.anthropicSpeed,
+		// We pass `speed` through in case a future pi-ai version honors it
+		// directly — harmless if dropped (current behavior). The actual
+		// fast-mode activation happens in the proxy via the marker header.
+		...(useFastMode ? { speed: "fast" as const } : {}),
 		headers: {
 			...(options?.headers ?? {}),
 			Authorization: `Bearer ${accessToken}`,
+			...(useFastMode && fastModeProxy ? { [FAST_MODE_MARKER_HEADER]: "1" } : {}),
 		},
 	});
 }
@@ -870,6 +1009,36 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		debugLog("No startup Hawk token found; model discovery deferred until /login");
 	}
 
+	// Capture pi reference so streamHawk can publish fast-mode badge events.
+	piRef = pi;
+
+	// Start the in-extension fast-mode injection proxy. Required for
+	// `*-fast` Anthropic model variants to actually get fast tier (pi-ai
+	// doesn't expose `speed: "fast"` itself). Best-effort: on failure we
+	// log and continue — fast variants will silently downgrade to standard
+	// tier rather than blocking the whole extension.
+	const fastModeDisabled =
+		process.env.HAWK_FAST_MODE_DISABLE === "1" || process.env.HAWK_FAST_MODE_DISABLE === "true";
+	if (!fastModeDisabled) {
+		try {
+			fastModeProxy = await startFastModeProxy(config.anthropicBaseUrl);
+			debugLog("Fast-mode proxy started", {
+				port: fastModeProxy.port,
+				baseUrl: fastModeProxy.getBaseUrl(),
+				forwardingTo: config.anthropicBaseUrl,
+			});
+		} catch (error) {
+			console.error(
+				`[pi-hawk-provider] failed to start fast-mode proxy: ${
+					error instanceof Error ? error.message : String(error)
+				} — fast-tier models will run as standard tier`,
+			);
+			fastModeProxy = undefined;
+		}
+	} else {
+		debugLog("Fast-mode proxy disabled via HAWK_FAST_MODE_DISABLE");
+	}
+
 	pi.registerProvider("hawk", {
 		baseUrl: config.middlemanBaseUrl,
 		apiKey: "HAWK_ACCESS_TOKEN",
@@ -886,6 +1055,72 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	});
 
 	registerRelayListener(pi);
+	registerFastModeCommand(pi);
+
+	// Initialize the badge so any stale state from a previous publisher
+	// (e.g. pi-cas-provider in the same session) gets cleared. If fast
+	// mode is already enabled at launch (from env or persisted state),
+	// show "muted" intent until the next request lights it as "on".
+	publishFastModeBadge({ intent: fastModeEnabled });
+
+	if (fastModeEnabled) {
+		const source =
+			process.env.HAWK_FAST_MODE === "1" || process.env.HAWK_FAST_MODE === "true"
+				? "HAWK_FAST_MODE env"
+				: "persisted preference";
+		console.error(`[pi-hawk-provider] fast mode enabled at startup — source: ${source}`);
+	}
+}
+
+function registerFastModeCommand(pi: ExtensionAPI): void {
+	pi.registerCommand("fast", {
+		description: "Toggle Anthropic fast mode for hawk-routed Opus turns (on/off/status)",
+		getArgumentCompletions: (prefix: string) => {
+			const opts = ["on", "off", "status"];
+			const matches = opts.filter((o) => o.startsWith(prefix.toLowerCase()));
+			return matches.length ? matches.map((o) => ({ value: o, label: o })) : null;
+		},
+		handler: async (args: string, ctx: SlashCommandContext) => {
+			const arg = args.trim().toLowerCase();
+			let changed = false;
+			if (arg === "on") {
+				fastModeEnabled = true;
+				changed = true;
+			} else if (arg === "off") {
+				fastModeEnabled = false;
+				changed = true;
+			}
+			if (changed) {
+				saveState({ fastMode: fastModeEnabled });
+				publishFastModeBadge({ intent: fastModeEnabled });
+			}
+
+			const heading = changed
+				? `hawk fast mode → ${fastModeEnabled ? "ON" : "off"} (saved)`
+				: `hawk fast mode: ${fastModeEnabled ? "ON" : "off"}`;
+
+			const lines: string[] = [heading];
+			lines.push("  Active on claude-opus-4-6 / -4-7 / -4-8 only (other models pass through).");
+			lines.push("  ~6× standard Opus pricing when billed against fast tier.");
+			lines.push(`  Preference persisted to ${statePath()}.`);
+
+			if (!fastModeProxy) {
+				lines.push(
+					"  ⚠︎  Fast-mode proxy not running — toggle is set but injection won't happen.",
+				);
+				lines.push("      (See HAWK_FAST_MODE_DISABLE env or startup log for cause.)");
+			}
+
+			if (process.env.HAWK_FAST_MODE !== undefined) {
+				lines.push(
+					`  Note: HAWK_FAST_MODE=${process.env.HAWK_FAST_MODE} is set; ` +
+						"it overrides the saved value on next launch.",
+				);
+			}
+
+			ctx.ui.notify(lines.join("\n"), changed ? "info" : "info");
+		},
+	});
 }
 
 /**
