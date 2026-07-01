@@ -492,14 +492,48 @@ function extractUpstreamModel(name: string): { backend: HawkBackend; upstreamMod
 	return null;
 }
 
+/**
+ * Middleman/Hawk exposes some models with routing suffixes that don't exist in
+ * pi-ai's built-in metadata tables. For example `claude-fable-5-data-retention`
+ * is the zero-data-retention route for `claude-fable-5` (the upstream response
+ * even reports `model: "claude-fable-5"`). Strip these so the variant can borrow
+ * the base model's metadata while still routing under its full upstream id.
+ *
+ * Keep entries longest-first so more specific suffixes win.
+ */
+const MIDDLEMAN_MODEL_SUFFIXES = ["-data-retention"] as const;
+
+function stripMiddlemanSuffix(modelId: string): string | undefined {
+	for (const suffix of MIDDLEMAN_MODEL_SUFFIXES) {
+		if (modelId.length > suffix.length && modelId.endsWith(suffix)) {
+			return modelId.slice(0, -suffix.length);
+		}
+	}
+	return undefined;
+}
+
 function findBuiltInModel(backend: HawkBackend, upstreamModel: string): Model<Api> | undefined {
 	const map = backend === "openai" ? builtInOpenAIModels : builtInAnthropicModels;
-	const exact = map.get(upstreamModel);
-	if (exact) return exact;
 
-	const leaf = upstreamModel.split("/").at(-1);
-	if (!leaf) return undefined;
-	return map.get(leaf);
+	const candidates: string[] = [];
+	const addCandidate = (value: string | undefined): void => {
+		if (value && !candidates.includes(value)) candidates.push(value);
+	};
+
+	addCandidate(upstreamModel);
+	addCandidate(upstreamModel.split("/").at(-1));
+
+	// Fall back to the base model id once known middleman routing suffixes are
+	// stripped (e.g. `claude-fable-5-data-retention` -> `claude-fable-5`).
+	const base = stripMiddlemanSuffix(upstreamModel);
+	addCandidate(base);
+	if (base) addCandidate(base.split("/").at(-1));
+
+	for (const candidate of candidates) {
+		const found = map.get(candidate);
+		if (found) return found;
+	}
+	return undefined;
 }
 
 function resolvedOpenAIApiFromBuiltIn(model: Model<Api>): "openai-completions" | "openai-responses" | undefined {
@@ -600,9 +634,15 @@ function buildDiscoveredModels(permittedModelNames: string[]): HawkModelConfig[]
 			...(builtIn.compat ? { compat: builtIn.compat } : {}),
 		} satisfies Omit<HawkModelConfig, "id" | "name">;
 
+		// When the upstream id carries a middleman routing suffix (e.g.
+		// `-data-retention`), the built-in metadata comes from the base model, so
+		// disambiguate the picker label to avoid two identical names.
+		const matchedSuffix = MIDDLEMAN_MODEL_SUFFIXES.find((s) => upstreamModel.endsWith(s)) ?? "";
+		const displayName = matchedSuffix ? `${builtIn.name}${matchedSuffix} (Hawk)` : `${builtIn.name} (Hawk)`;
+
 		models.push({
 			id: upstreamModel,
-			name: `${builtIn.name} (Hawk)`,
+			name: displayName,
 			...shared,
 		});
 
